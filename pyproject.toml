@@ -1,0 +1,24 @@
+[project]
+name = "echo-annotator"
+version = "0.1.0"
+description = "DICOM echocardiogram viewer and annotation tool for pericardial fat segmentation"
+authors = [
+    { name = "Praneeth Sadda", email = "psadda@gmail.com" }
+]
+requires-python = ">=3.14"
+dependencies = [
+    "numpy>=2.5.4",
+    "pillow>=13.0.0",
+    "pydicom>=3.0.2",
+    "pylibjpeg>=2.1.0",
+    "pylibjpeg-libjpeg>=2.5.0",
+    "pylibjpeg-openjpeg>=2.6.0",
+    "pyside6>=6.12.0",
+]
+
+[project.scripts]
+echo-annotator = "echo_annotator:main"
+
+[build-system]
+requires = ["uv_build>=0.11.21,<0.12.0"]
+build-backend = "uv_build"
