@@ -29,6 +29,13 @@ class Clip:
     def n_frames(self) -> int:
         return self.frames.shape[0]
 
+    def gray(self, index: int) -> np.ndarray:
+        """Frame `index` as a 2-D uint8 image (luma if the clip is RGB), for image-processing tools."""
+        frame = self.frames[index]
+        if frame.ndim == 2:
+            return frame
+        return np.dot(frame[..., :3], [0.299, 0.587, 0.114]).round().astype(np.uint8)
+
 
 def load_clip(path: Path) -> Clip:
     try:
