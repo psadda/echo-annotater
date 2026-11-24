@@ -1,7 +1,7 @@
 [project]
 name = "echo-annotator"
 version = "0.1.0"
-description = "DICOM echocardiogram viewer and annotation tool for pericardial fat segmentation"
+description = "Echocardiogram video viewer and annotation tool for pericardial fat segmentation"
 authors = [
     { name = "Praneeth Sadda", email = "psadda@gmail.com" }
 ]
@@ -10,11 +10,7 @@ dependencies = [
     "numpy>=2.5.4",
     "opencv-python-headless>=5.0.0.93",
     "pillow>=13.0.0",
-    "pydicom>=3.0.2",
-    "pylibjpeg>=2.1.0",
-    "pylibjpeg-libjpeg>=2.5.0",
-    "pylibjpeg-openjpeg>=2.6.0",
-    "pyside6>=6.12.0",
+    "pyside6-essentials>=6.12.0",
     "scikit-image>=0.26.0",
 ]
 
@@ -24,3 +20,16 @@ echo-annotator = "echo_annotator:main"
 [build-system]
 requires = ["uv_build>=0.11.21,<0.12.0"]
 build-backend = "uv_build"
+
+[dependency-groups]
+dev = [
+    "pytest>=9.2.0",
+]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+pythonpath = ["."]  # so tests can import launcher.py from the project root
+filterwarnings = [
+    # The only way to build a drag event in a test; Qt marks the constructor deprecated.
+    "ignore:Function.*QDragEnterEvent:DeprecationWarning",
+]

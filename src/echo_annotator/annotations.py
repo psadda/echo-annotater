@@ -32,8 +32,8 @@ class AnnotationError(Exception):
     """Raised when an existing annotation sidecar can't be used for the current clip."""
 
 
-def sidecar_path(dicom_path: Path) -> Path:
-    return dicom_path.with_name(dicom_path.name + ".annotations.json")
+def sidecar_path(path: Path) -> Path:
+    return path.with_name(path.name + ".annotations.json")
 
 
 def rasterize(polygons: list[Polygon], height: int, width: int) -> np.ndarray:
@@ -53,7 +53,7 @@ def rasterize(polygons: list[Polygon], height: int, width: int) -> np.ndarray:
 
 @dataclass
 class AnnotationSet:
-    dicom_path: Path
+    path: Path
     n_frames: int
     height: int
     width: int
@@ -65,7 +65,7 @@ class AnnotationSet:
 
     def _disk_stamp(self) -> tuple[int, int] | None:
         try:
-            stat = sidecar_path(self.dicom_path).stat()
+            stat = sidecar_path(self.path).stat()
         except OSError:
             return None
         return stat.st_mtime_ns, stat.st_size
@@ -166,10 +166,10 @@ class AnnotationSet:
 
     def save(self) -> None:
         """Write all polygons to the sidecar JSON."""
-        json_path = sidecar_path(self.dicom_path)
+        json_path = sidecar_path(self.path)
         payload = {
             "version": FORMAT_VERSION,
-            "dicom": self.dicom_path.name,
+            "source": self.path.name,
             "label": LABEL,
             "image_size": {"width": self.width, "height": self.height},
             "n_frames": self.n_frames,
@@ -184,10 +184,10 @@ class AnnotationSet:
         self._stamp = self._disk_stamp()
 
     @classmethod
-    def load(cls, dicom_path: Path, n_frames: int, height: int, width: int) -> AnnotationSet:
+    def load(cls, path: Path, n_frames: int, height: int, width: int) -> AnnotationSet:
         """Read the sidecar if present (else an empty set); AnnotationError if it doesn't match."""
-        result = cls(dicom_path, n_frames, height, width)
-        json_path = sidecar_path(dicom_path)
+        result = cls(path, n_frames, height, width)
+        json_path = sidecar_path(path)
         result._stamp = result._disk_stamp()
         if not json_path.exists():
             return result

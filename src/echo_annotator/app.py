@@ -26,8 +26,8 @@ PRESERVE_CURVATURE_KEY = "preserve_curvature"
 
 CONTROLS = """\
 Files
-  Ctrl+O / drag and drop    open a DICOM or AVI
-  Up / Down                 next / previous DICOM or AVI in the folder
+  Ctrl+O / drag and drop    open an AVI
+  Up / Down                 next / previous AVI in the folder
 Playback
   Space                     pause / resume
   Left / Right (paused)     previous / next frame
@@ -77,7 +77,7 @@ class Drag:
 
 
 class MainWindow(QMainWindow):
-    def __init__(self) -> None:
+    def __init__(self, settings: QSettings | None = None) -> None:
         super().__init__()
         self.setWindowTitle(TITLE)
         self.resize(960, 720)
@@ -93,7 +93,7 @@ class MainWindow(QMainWindow):
         self.viewer.view_changed.connect(self._update_info)
         self.setCentralWidget(self.viewer)
 
-        self._info = QLabel("Drop a DICOM or AVI here or press Ctrl+O")
+        self._info = QLabel("Drop an AVI here or press Ctrl+O")
         self.statusBar().addPermanentWidget(self._info, 1)
 
         open_action = QAction("&Open echo...", self)
@@ -108,7 +108,8 @@ class MainWindow(QMainWindow):
         propagate_action = QAction("&Propagate polygon\tCtrl+T", self)
         propagate_action.triggered.connect(self.propagate_current)
         tools_menu.addAction(propagate_action)
-        self._settings = QSettings("EchoAnnotator", "EchoAnnotator")
+        # Injectable so tests never touch the real user profile (the Windows registry).
+        self._settings = settings if settings is not None else QSettings("EchoAnnotator", "EchoAnnotator")
         self._curvature_action = QAction("Preserve contour &curvature when propagating", self, checkable=True)
         self._curvature_action.setChecked(self._settings.value(PRESERVE_CURVATURE_KEY, False, type=bool))
         self._curvature_action.toggled.connect(lambda on: self._settings.setValue(PRESERVE_CURVATURE_KEY, on))
@@ -141,7 +142,7 @@ class MainWindow(QMainWindow):
     def open_dialog(self) -> None:
         start = str(self.clip.path.parent) if self.clip else ""
         name, _ = QFileDialog.getOpenFileName(
-            self, "Open echo", start, "All files (*);;Echo files (*.dcm *.dicom *.avi)"
+            self, "Open echo", start, "Echo videos (*.avi);;All files (*)"
         )
         if name:
             self.open_path(Path(name))
@@ -173,7 +174,7 @@ class MainWindow(QMainWindow):
     def _annotations_for(self, clip: Clip) -> AnnotationSet | None:
         """The clip's annotation set, reusing the one from earlier in this session if it matches.
 
-        Reusing the live object (rather than re-reading the sidecar) is what keeps each DICOM's
+        Reusing the live object (rather than re-reading the sidecar) is what keeps each file's
         undo/redo history when you switch away and back. It is never written to disk. If the
         sidecar changed on disk in the meantime, the set is reloaded and its history starts over.
         """
