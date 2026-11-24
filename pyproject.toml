@@ -10,7 +10,7 @@ license = "GPL-3.0-or-later"
 license-files = ["LICENSE"]
 dependencies = [
     "numpy>=2.5.4",
-    "opencv-python-headless>=5.0.0.93",
+    "opencv-python-headless>=5.0.0.93,<5.1",  # 5.1 wheels need macOS 15; 5.0 runs on macOS 14
     "wxpython>=4.3.2",
 ]
 
@@ -46,7 +46,7 @@ sources = ["src/echo_annotator"]
 # Briefcase installs these into the bundle; keep them in step with [project].dependencies.
 requires = [
     "numpy>=2.5.4",
-    "opencv-python-headless>=5.0.0.93",
+    "opencv-python-headless>=5.0.0.93,<5.1",  # 5.1 wheels need macOS 15; 5.0 runs on macOS 14
     "wxpython>=4.3.2",
 ]
 
