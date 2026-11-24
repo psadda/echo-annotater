@@ -12,13 +12,14 @@ from skimage.measure import approximate_polygon, find_contours
 from skimage.segmentation import inverse_gaussian_gradient, morphological_geodesic_active_contour
 
 from .annotations import Polygon, rasterize
-from .geometry import polygon_area
+from .geometry import polygon_area, resample_polygon, target_vertex_count
 
 GROW_ITERATIONS = 10  # each iteration grows the mask by at most ~1 px, so this is the max growth per call
 EDGE_SIGMA = 2.0  # px; smooths speckle before measuring edge strength
 EDGE_ALPHA = 100.0  # how sharply edge strength stops the contour (image scaled to 0-1)
 SIMPLIFY_TOLERANCE = 0.75  # px; keeps the grown polygon editable instead of one vertex per pixel
-MIN_GROWTH = 1.0  # px^2; less than this counts as "nothing to grow"
+MIN_GROWTH = 1.0  # px^2; less than this counts as "nothing to grow"...
+MIN_GROWTH_FRACTION = 0.02  # ...as does a gain of less than this fraction of the polygon's area
 
 
 def grow_polygon(
@@ -26,7 +27,8 @@ def grow_polygon(
 ) -> Polygon | None:
     """Return `polygon` grown on `gray` (2-D uint8), or None if it could not grow.
 
-    The result always contains the original polygon: growth never shrinks it.
+    The grown region always contains the original (growth never shrinks it). The returned polygon has evenly
+    spaced vertices, 16-32 of them, so it approximates that region to within a fraction of a pixel to a pixel or so.
     """
     height, width = gray.shape
     start = rasterize([polygon], height, width) > 0
@@ -39,8 +41,15 @@ def grow_polygon(
     )
     grown = level_set.astype(bool) | start
 
-    result = _largest_outline(grown)
-    if result is None or polygon_area(result) - polygon_area(polygon) < MIN_GROWTH:
+    outline = _largest_outline(grown)
+    if outline is None:
+        return None
+    # Evenly spaced vertices: far fewer than the pixel-level outline, and what the tracker works best with.
+    result = resample_polygon(outline, target_vertex_count(outline))
+    area = polygon_area(polygon)
+    # Resampling cuts corners slightly, so a polygon that has filled its region still "regrows" a little
+    # each time. Only a real gain counts, otherwise repeated presses would never report "nothing to grow".
+    if polygon_area(result) - area < max(MIN_GROWTH, MIN_GROWTH_FRACTION * area):
         return None
     return result
 

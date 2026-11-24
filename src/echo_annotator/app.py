@@ -8,12 +8,12 @@ from contextlib import contextmanager
 from dataclasses import dataclass
 from pathlib import Path
 
-from PySide6.QtCore import QTimer, Qt
+from PySide6.QtCore import QSettings, QTimer, Qt
 from PySide6.QtGui import QAction, QDragEnterEvent, QDropEvent, QFontDatabase, QKeyEvent, QKeySequence
 from PySide6.QtWidgets import QApplication, QFileDialog, QLabel, QMainWindow, QMessageBox
 
 from .annotations import AnnotationError, AnnotationSet, Polygon
-from .dicom_io import Clip, DicomLoadError, load_clip, sibling_dicoms
+from .clip_io import Clip, ClipLoadError, load_clip, sibling_clips
 from .geometry import nearest_edge, nearest_vertex, polygon_area, polygon_at
 from .grow import grow_polygon
 from .tracking import propagate_polygon
@@ -22,11 +22,12 @@ from .viewer import ViewerWidget
 TITLE = "Echo Annotator"
 HIT_RADIUS_PX = 8  # on-screen distance for grabbing vertices/edges and closing a polygon
 ZOOM_KEY_STEP = 1.5
+PRESERVE_CURVATURE_KEY = "preserve_curvature"
 
 CONTROLS = """\
 Files
-  Ctrl+O / drag and drop    open a DICOM
-  Up / Down                 next / previous DICOM in the folder
+  Ctrl+O / drag and drop    open a DICOM or AVI
+  Up / Down                 next / previous DICOM or AVI in the folder
 Playback
   Space                     pause / resume
   Left / Right (paused)     previous / next frame
@@ -46,11 +47,13 @@ Editing (paused)
   Right-click a vertex      delete it (polygons keep at least 3)
   Ctrl+click in a polygon   select it (Ctrl+click elsewhere deselects)
   Delete                    delete the selected polygon, or clear the frame
-  Ctrl+Z / Ctrl+Y           undo / redo (kept per DICOM while the app is open)
+  Ctrl+Z / Ctrl+Y           undo / redo (kept per file while the app is open)
 Tools (paused; act on the selected polygon, or the frame's only polygon)
   Ctrl+R                    grow it on this frame with an active contour (press again to grow more)
   Ctrl+T                    track it to all other frames with optical flow, forward and back;
-                            replaces any polygons already on those frames
+                            replaces any polygons already on those frames. The tracked polygons have
+                            evenly spaced vertices (16-32); Tools > Preserve contour curvature keeps the
+                            source shape's local curvature (stronger de-noising, less shape freedom)
 """
 
 
@@ -90,13 +93,26 @@ class MainWindow(QMainWindow):
         self.viewer.view_changed.connect(self._update_info)
         self.setCentralWidget(self.viewer)
 
-        self._info = QLabel("Drop a DICOM here or press Ctrl+O")
+        self._info = QLabel("Drop a DICOM or AVI here or press Ctrl+O")
         self.statusBar().addPermanentWidget(self._info, 1)
 
-        open_action = QAction("&Open DICOM...", self)
+        open_action = QAction("&Open echo...", self)
         open_action.setShortcut(QKeySequence("Ctrl+O"))
         open_action.triggered.connect(self.open_dialog)
         self.menuBar().addMenu("&File").addAction(open_action)
+        # The Ctrl+R / Ctrl+T shortcuts are handled in keyPressEvent; the tab just displays them in the menu.
+        tools_menu = self.menuBar().addMenu("&Tools")
+        grow_action = QAction("&Grow polygon\tCtrl+R", self)
+        grow_action.triggered.connect(self.grow_current)
+        tools_menu.addAction(grow_action)
+        propagate_action = QAction("&Propagate polygon\tCtrl+T", self)
+        propagate_action.triggered.connect(self.propagate_current)
+        tools_menu.addAction(propagate_action)
+        self._settings = QSettings("EchoAnnotator", "EchoAnnotator")
+        self._curvature_action = QAction("Preserve contour &curvature when propagating", self, checkable=True)
+        self._curvature_action.setChecked(self._settings.value(PRESERVE_CURVATURE_KEY, False, type=bool))
+        self._curvature_action.toggled.connect(lambda on: self._settings.setValue(PRESERVE_CURVATURE_KEY, on))
+        tools_menu.addAction(self._curvature_action)
         help_action = QAction("&Controls...", self)
         help_action.triggered.connect(self.show_controls)
         self.menuBar().addMenu("&Help").addAction(help_action)
@@ -108,7 +124,7 @@ class MainWindow(QMainWindow):
         self.frame = 0
         self.playing = False
         self.annotations: AnnotationSet | None = None
-        self._annotation_cache: dict[Path, AnnotationSet] = {}  # per DICOM, in memory for this session
+        self._annotation_cache: dict[Path, AnnotationSet] = {}  # per file, in memory for this session
         self.pending: Polygon = []  # polygon being drawn on the current frame
         self.selected: int | None = None  # index into the current frame's polygons
         self._drag: Drag | None = None
@@ -125,7 +141,7 @@ class MainWindow(QMainWindow):
     def open_dialog(self) -> None:
         start = str(self.clip.path.parent) if self.clip else ""
         name, _ = QFileDialog.getOpenFileName(
-            self, "Open DICOM", start, "All files (*);;DICOM files (*.dcm *.dicom)"
+            self, "Open echo", start, "All files (*);;Echo files (*.dcm *.dicom *.avi)"
         )
         if name:
             self.open_path(Path(name))
@@ -134,10 +150,10 @@ class MainWindow(QMainWindow):
         """Load `path` and start playing it. Leaves the current clip untouched on failure."""
         try:
             clip = load_clip(path)
-        except DicomLoadError as exc:
+        except ClipLoadError as exc:
             self.statusBar().showMessage(f"Could not open: {exc}", 8000)
             return False
-        self._siblings = sibling_dicoms(path)
+        self._siblings = sibling_clips(path)
         self._index = self._siblings.index(path)
         self._show_clip(clip)
         return True
@@ -187,14 +203,14 @@ class MainWindow(QMainWindow):
         while 0 <= i < len(self._siblings):
             try:
                 clip = load_clip(self._siblings[i])
-            except DicomLoadError:
+            except ClipLoadError:
                 i += step
                 continue
             self._index = i
             self._show_clip(clip)
             return
         self.statusBar().showMessage(
-            "Last DICOM in folder" if step > 0 else "First DICOM in folder", 2000
+            "Last file in folder" if step > 0 else "First file in folder", 2000
         )
 
     # ---- playback ------------------------------------------------------------------------
@@ -434,6 +450,10 @@ class MainWindow(QMainWindow):
             f"Grew polygon from {polygon_area(polygon):.0f} to {polygon_area(grown):.0f} px²", 4000
         )
 
+    @property
+    def preserve_curvature(self) -> bool:
+        return self._curvature_action.isChecked()
+
     def propagate_current(self) -> None:
         """Ctrl+T: track the current polygon to every other frame with sparse optical flow."""
         target = self._tool_target()
@@ -441,7 +461,9 @@ class MainWindow(QMainWindow):
             return
         index, polygon = target
         with _busy():
-            tracked = propagate_polygon(self.clip.gray, self.clip.n_frames, self.frame, polygon)
+            tracked = propagate_polygon(
+                self.clip.gray, self.clip.n_frames, self.frame, polygon, self.preserve_curvature
+            )
         if not tracked:
             self.statusBar().showMessage("Could not track the polygon to any other frame", 4000)
             return
@@ -451,6 +473,8 @@ class MainWindow(QMainWindow):
         self._after_edit()
         forward = sum(1 for frame in tracked if frame > self.frame)
         message = f"Propagated to {forward} frames forward and {len(tracked) - forward} back"
+        if self.preserve_curvature:
+            message += " (curvature preserved)"
         if replaced:
             message += f" (replaced annotations on {replaced})"
         if len(tracked) < self.clip.n_frames - 1:

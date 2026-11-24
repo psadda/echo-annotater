@@ -1,11 +1,41 @@
-"""Hit-testing for polygon editing, in image coordinates."""
+"""Polygon geometry: hit-testing for editing, and arc-length resampling, in image coordinates."""
 
 from __future__ import annotations
 
 import math
 
+import numpy as np
+
 Point = tuple[float, float]
 Polygon = list[Point]
+
+RESAMPLE_SPACING = 6.0  # px between vertices when a polygon is resampled...
+RESAMPLE_MIN, RESAMPLE_MAX = 16, 32  # ...within these vertex counts
+
+
+def polygon_perimeter(polygon: Polygon) -> float:
+    return sum(math.hypot(bx - ax, by - ay) for (ax, ay), (bx, by) in zip(polygon, polygon[1:] + polygon[:1]))
+
+
+def target_vertex_count(polygon: Polygon) -> int:
+    """How many vertices to resample `polygon` to: about one per RESAMPLE_SPACING px, within limits."""
+    return min(max(round(polygon_perimeter(polygon) / RESAMPLE_SPACING), RESAMPLE_MIN), RESAMPLE_MAX)
+
+
+def resample_polygon(polygon: Polygon, count: int) -> Polygon:
+    """`count` vertices evenly spaced by arc length around the closed polygon.
+
+    The first vertex stays exactly where it was and the direction is kept, so vertex i keeps meaning
+    "the point i/count of the way round" from one call to the next.
+    """
+    points = np.asarray(polygon, dtype=np.float64)
+    ring = np.vstack([points, points[:1]])
+    distance = np.concatenate([[0.0], np.cumsum(np.linalg.norm(np.diff(ring, axis=0), axis=1))])
+    if distance[-1] == 0:
+        return [tuple(map(float, points[0]))] * count
+    wanted = np.linspace(0.0, distance[-1], count, endpoint=False)
+    xs, ys = np.interp(wanted, distance, ring[:, 0]), np.interp(wanted, distance, ring[:, 1])
+    return [(float(x), float(y)) for x, y in zip(xs, ys)]
 
 
 def polygon_area(polygon: Polygon) -> float:
