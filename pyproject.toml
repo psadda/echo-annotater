@@ -6,6 +6,8 @@ authors = [
     { name = "Praneeth Sadda", email = "psadda@gmail.com" }
 ]
 requires-python = ">=3.14"
+license = "GPL-3.0-or-later"
+license-files = ["LICENSE"]
 dependencies = [
     "numpy>=2.5.4",
     "opencv-python-headless>=5.0.0.93",
@@ -21,7 +23,7 @@ build-backend = "uv_build"
 
 [dependency-groups]
 dev = [
-    "pyinstaller>=6.22.3",
+    "briefcase>=0.4.7",
     "pytest>=9.2.0",
 ]
 
@@ -32,3 +34,21 @@ filterwarnings = [
     # The only way to build a drag event in a test; Qt marks the constructor deprecated.
     "ignore:Function.*QDragEnterEvent:DeprecationWarning",
 ]
+
+[tool.briefcase]
+project_name = "echo-annotator"
+bundle = "com.psadda"  # reverse-domain prefix; the app's identifier is this plus the app name
+
+[tool.briefcase.app.echo-annotator]
+formal_name = "Echo Annotator"
+description = "Echocardiogram video viewer and annotation tool for pericardial fat segmentation"
+sources = ["src/echo_annotator"]
+# Briefcase installs these into the bundle; keep them in step with [project].dependencies.
+requires = [
+    "numpy>=2.5.4",
+    "opencv-python-headless>=5.0.0.93",
+    "wxpython>=4.3.2",
+]
+
+[tool.briefcase.app.echo-annotator.macOS]
+universal_build = false  # OpenCV and wxPython do not all ship universal2 wheels; build for the runner's architecture

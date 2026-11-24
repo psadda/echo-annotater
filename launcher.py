@@ -1,4 +1,4 @@
-"""Entry point for packaged builds (e.g. PyInstaller), which need a plain script rather than a console command."""
+"""Plain-script entry point, for tools that need a file to run rather than a console command."""
 
 from echo_annotator import main
 

@@ -1,0 +1,51 @@
+name: Build installers
+
+# Run it by hand (Actions tab > Build installers > Run workflow) or by pushing a version tag such as v0.1.0.
+on:
+  workflow_dispatch:
+  push:
+    tags: ["v*"]
+
+jobs:
+  build:
+    name: ${{ matrix.name }}
+    runs-on: ${{ matrix.runner }}
+    strategy:
+      fail-fast: false  # a failure on one platform should not hide the result on the other
+      matrix:
+        include:
+          - name: Windows
+            runner: windows-latest
+            platform: windows
+          - name: macOS (Apple Silicon)
+            runner: macos-latest
+            platform: macOS
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: astral-sh/setup-uv@v5
+        with:
+          python-version: "3.14"
+
+      - name: Install dependencies
+        run: uv sync --locked
+
+      # Briefcase builds for the machine it runs on, which is why there is one job per platform.
+      - name: Create the app bundle
+        run: uv run briefcase create ${{ matrix.platform }} --no-input
+
+      - name: Build the app
+        run: uv run briefcase build ${{ matrix.platform }} --no-input
+
+      # --adhoc-sign builds without a code-signing certificate. The result runs, but Windows SmartScreen and
+      # macOS Gatekeeper will warn the first time; see the README notes for how to open it anyway.
+      - name: Package the installer
+        run: uv run briefcase package ${{ matrix.platform }} --adhoc-sign --no-input
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: echo-annotator-${{ matrix.platform }}
+          path: dist/*
+          if-no-files-found: error
+          retention-days: 30

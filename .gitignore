@@ -11,3 +11,6 @@ wheels/
 
 # Downloaded datasets (large, and not ours to redistribute)
 data/
+
+# Briefcase output
+logs/
