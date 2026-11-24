@@ -9,8 +9,6 @@ requires-python = ">=3.14"
 dependencies = [
     "numpy>=2.5.4",
     "opencv-python-headless>=5.0.0.93",
-    "pillow>=13.0.0",
-    "scikit-image>=0.26.0",
     "wxpython>=4.3.2",
 ]
 

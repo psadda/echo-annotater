@@ -14,13 +14,11 @@ from dataclasses import dataclass, field
 from pathlib import Path
 
 import numpy as np
-from PIL import Image, ImageDraw
 
 LABEL = "pericardial_fat"
 FORMAT_VERSION = 1
 MIN_VERTICES = 3
 MAX_HISTORY = 200
-SUPERSAMPLE = 4  # fat stripes are only a few pixels thick, so rasterize with sub-pixel accuracy
 
 Point = tuple[float, float]
 Polygon = list[Point]
@@ -39,16 +37,37 @@ def sidecar_path(path: Path) -> Path:
 def rasterize(polygons: list[Polygon], height: int, width: int) -> np.ndarray:
     """Union of `polygons` as a (height, width) uint8 mask with values 0/255.
 
-    Not used by the app itself; this is the conversion to apply to a frame's polygons from the JSON.
+    A pixel is inside a polygon when its centre is (even-odd rule). Used to turn a polygon into the mask the
+    active contour starts from, and the conversion to apply to a frame's polygons from the JSON when masks
+    are needed.
     """
-    s = SUPERSAMPLE
-    big = Image.new("L", (width * s, height * s), 0)
-    draw = ImageDraw.Draw(big)
+    crossings = np.zeros((height, width + 1), np.int16)  # per row: +1 where a span of inside pixels starts, -1 where it ends
     for polygon in polygons:
-        # PIL treats integer coordinates as pixel centres, hence the -0.5
-        draw.polygon([(x * s - 0.5, y * s - 0.5) for x, y in polygon], fill=255)
-    small = np.asarray(big.resize((width, height), Image.Resampling.BOX))
-    return np.where(small >= 128, 255, 0).astype(np.uint8)
+        points = np.asarray(polygon, dtype=np.float64)
+        x0, y0 = points.T
+        x1, y1 = np.roll(points, -1, axis=0).T
+        # Rows r whose centre line y = r + 0.5 crosses an edge, half-open so a shared vertex counts once.
+        first = np.ceil(np.minimum(y0, y1) - 0.5).astype(int)
+        last = np.ceil(np.maximum(y0, y1) - 0.5).astype(int)  # exclusive
+        edge = np.repeat(np.arange(len(points)), np.maximum(last - first, 0))
+        if len(edge) == 0:
+            continue
+        starts = np.cumsum(np.concatenate([[0], np.maximum(last - first, 0)[:-1]]))
+        rows = first[edge] + (np.arange(len(edge)) - starts[edge])
+        keep = (rows >= 0) & (rows < height)
+        edge, rows = edge[keep], rows[keep]
+        xs = x0[edge] + (rows + 0.5 - y0[edge]) * (x1[edge] - x0[edge]) / (y1[edge] - y0[edge])
+        order = np.lexsort((xs, rows))  # by row, then left to right: crossings alternate enter / leave
+        rows, xs = rows[order], xs[order]
+        group_start = np.flatnonzero(np.r_[True, rows[1:] != rows[:-1]])
+        rank = np.arange(len(rows)) - np.repeat(group_start, np.diff(np.r_[group_start, len(rows)]))
+        enter = np.flatnonzero(rank % 2 == 0)
+        leave = enter + 1  # a closed polygon crosses each centre line an even number of times
+        c0 = np.clip(np.ceil(xs[enter] - 0.5).astype(int), 0, width)
+        c1 = np.clip(np.ceil(xs[leave] - 0.5).astype(int), 0, width)
+        np.add.at(crossings, (rows[enter], c0), 1)
+        np.add.at(crossings, (rows[enter], c1), -1)
+    return np.where(np.cumsum(crossings, axis=1)[:, :width] > 0, 255, 0).astype(np.uint8)
 
 
 @dataclass

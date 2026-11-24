@@ -30,6 +30,48 @@ class TestRasterize:
         assert mask.sum() // 255 == 36 + 36 - 9
 
 
+class TestRasterizeGeometry:
+    def test_pixels_are_inside_when_their_centre_is(self):
+        # a strip from x=1.0 to 3.4: centres at 1.5 and 2.5 are inside, 3.5 is just outside
+        mask = rasterize([[(1.0, 1.0), (3.4, 1.0), (3.4, 3.0), (1.0, 3.0)]], 5, 6)
+        assert mask[1:3, 1:3].all() and not mask[1:3, 3].any() and mask.sum() // 255 == 4
+
+    def test_area_is_unbiased_on_random_convex_polygons(self):
+        import cv2
+
+        from echo_annotator.geometry import polygon_area
+
+        rng = np.random.default_rng(1)
+        errors = []
+        for _ in range(150):
+            hull = cv2.convexHull(rng.uniform([3, 3], [97, 77], (7, 2)).astype(np.float32)).reshape(-1, 2)
+            polygon = [tuple(map(float, p)) for p in hull]
+            if len(polygon) >= 3 and polygon_area(polygon) > 100:
+                errors.append((rasterize([polygon], 80, 100) > 0).sum() / polygon_area(polygon) - 1)
+        assert abs(np.mean(errors)) < 0.005 and np.max(np.abs(errors)) < 0.06
+
+    def test_polygon_partly_outside_the_image_is_clipped(self):
+        mask = rasterize([[(-5.0, -5.0), (4.0, -5.0), (4.0, 4.0), (-5.0, 4.0)]], 10, 10)
+        assert mask[:4, :4].all() and mask.sum() // 255 == 16
+
+    def test_polygon_entirely_outside_is_empty(self):
+        assert not rasterize([[(50.0, 50.0), (60.0, 50.0), (55.0, 60.0)]], 10, 10).any()
+
+    def test_degenerate_polygons_are_empty(self):
+        assert not rasterize([[(3.0, 3.0), (3.0, 3.0), (3.0, 3.0)]], 10, 10).any()
+        assert not rasterize([[(1.0, 5.0), (8.0, 5.0), (4.0, 5.0)]], 10, 10).any()  # zero height
+
+    def test_vertex_exactly_on_a_pixel_row_centre_is_not_double_counted(self):
+        # the shared vertex (5, 2.5) sits exactly on a row centre line
+        mask = rasterize([[(0.0, 0.0), (5.0, 2.5), (0.0, 5.0)]], 6, 6)
+        assert 0 < mask.sum() // 255 <= 13  # a triangle of area 12.5, never a stripe or a hole
+
+    def test_concave_polygon_uses_even_odd_fill(self):
+        notch = [(0.0, 0.0), (10.0, 0.0), (10.0, 10.0), (5.0, 4.0), (0.0, 10.0)]
+        mask = rasterize([notch], 12, 12) > 0
+        assert mask[2, 2] and mask[2, 8] and not mask[8, 5]  # below the inner vertex is the notch, outside
+
+
 class TestEditing:
     def test_add_and_undo_redo(self, aset):
         aset.add(2, POLY)
