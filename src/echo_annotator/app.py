@@ -8,21 +8,20 @@ from contextlib import contextmanager
 from dataclasses import dataclass
 from pathlib import Path
 
-from PySide6.QtCore import QSettings, QTimer, Qt
-from PySide6.QtGui import QAction, QDragEnterEvent, QDropEvent, QFontDatabase, QKeyEvent, QKeySequence
-from PySide6.QtWidgets import QApplication, QFileDialog, QLabel, QMainWindow, QMessageBox
+import wx
 
 from .annotations import AnnotationError, AnnotationSet, Polygon
 from .clip_io import Clip, ClipLoadError, load_clip, sibling_clips
 from .geometry import nearest_edge, nearest_vertex, polygon_area, polygon_at
 from .grow import grow_polygon
 from .tracking import propagate_polygon
-from .viewer import ViewerWidget
+from .viewer import MOD_CTRL, MOD_SHIFT, ViewerWidget
 
 TITLE = "Echo Annotator"
 HIT_RADIUS_PX = 8  # on-screen distance for grabbing vertices/edges and closing a polygon
 ZOOM_KEY_STEP = 1.5
 PRESERVE_CURVATURE_KEY = "preserve_curvature"
+APP_NAME = "EchoAnnotator"
 
 CONTROLS = """\
 Files
@@ -59,11 +58,22 @@ Tools (paused; act on the selected polygon, or the frame's only polygon)
 
 @contextmanager
 def _busy():
-    QApplication.setOverrideCursor(Qt.CursorShape.WaitCursor)
-    try:
+    with wx.BusyCursor():
         yield
-    finally:
-        QApplication.restoreOverrideCursor()
+
+
+class _FileDrop(wx.FileDropTarget):
+    """Opens the first file dropped on the window it is attached to."""
+
+    def __init__(self, window: MainWindow) -> None:
+        super().__init__()
+        self._window = window
+
+    def OnDropFiles(self, x: int, y: int, filenames: list[str]) -> bool:
+        if not filenames:
+            return False
+        self._window.open_path(Path(filenames[0]))
+        return True
 
 
 @dataclass
@@ -76,14 +86,12 @@ class Drag:
     checkpointed: bool = False
 
 
-class MainWindow(QMainWindow):
-    def __init__(self, settings: QSettings | None = None) -> None:
-        super().__init__()
-        self.setWindowTitle(TITLE)
-        self.resize(960, 720)
-        self.setAcceptDrops(True)
+class MainWindow(wx.Frame):
+    def __init__(self, config: wx.ConfigBase | None = None) -> None:
+        super().__init__(None, title=TITLE)
+        self.SetClientSize((960, 720))
 
-        self.viewer = ViewerWidget()
+        self.viewer = ViewerWidget(self)
         self.viewer.pressed.connect(self._on_pressed)
         self.viewer.dragged.connect(self._on_dragged)
         self.viewer.released.connect(self._end_drag)
@@ -91,35 +99,42 @@ class MainWindow(QMainWindow):
         self.viewer.hovered.connect(self._on_hovered)
         self.viewer.finish_requested.connect(self.finish_polygon)
         self.viewer.view_changed.connect(self._update_info)
-        self.setCentralWidget(self.viewer)
+        # Drops go to the window under the pointer, so both need a target.
+        self.SetDropTarget(_FileDrop(self))
+        self.viewer.SetDropTarget(_FileDrop(self))
 
-        self._info = QLabel("Drop an AVI here or press Ctrl+O")
-        self.statusBar().addPermanentWidget(self._info, 1)
+        self.CreateStatusBar()
+        self._info_text = "Drop an AVI here or press Ctrl+O"
+        self._message = ""  # temporary status message; the info text shows again once it expires
+        self._message_timer = wx.Timer(self)
+        self.Bind(wx.EVT_TIMER, self._on_message_expired, source=self._message_timer)
+        self.SetStatusText(self._info_text)
 
-        open_action = QAction("&Open echo...", self)
-        open_action.setShortcut(QKeySequence("Ctrl+O"))
-        open_action.triggered.connect(self.open_dialog)
-        self.menuBar().addMenu("&File").addAction(open_action)
-        # The Ctrl+R / Ctrl+T shortcuts are handled in keyPressEvent; the tab just displays them in the menu.
-        tools_menu = self.menuBar().addMenu("&Tools")
-        grow_action = QAction("&Grow polygon\tCtrl+R", self)
-        grow_action.triggered.connect(self.grow_current)
-        tools_menu.addAction(grow_action)
-        propagate_action = QAction("&Propagate polygon\tCtrl+T", self)
-        propagate_action.triggered.connect(self.propagate_current)
-        tools_menu.addAction(propagate_action)
         # Injectable so tests never touch the real user profile (the Windows registry).
-        self._settings = settings if settings is not None else QSettings("EchoAnnotator", "EchoAnnotator")
-        self._curvature_action = QAction("Preserve contour &curvature when propagating", self, checkable=True)
-        self._curvature_action.setChecked(self._settings.value(PRESERVE_CURVATURE_KEY, False, type=bool))
-        self._curvature_action.toggled.connect(lambda on: self._settings.setValue(PRESERVE_CURVATURE_KEY, on))
-        tools_menu.addAction(self._curvature_action)
-        help_action = QAction("&Controls...", self)
-        help_action.triggered.connect(self.show_controls)
-        self.menuBar().addMenu("&Help").addAction(help_action)
+        self._settings = config if config is not None else wx.Config(APP_NAME, APP_NAME)
+        # Ctrl+O / Ctrl+R / Ctrl+T are menu accelerators (Cmd on macOS); the other keys go through _on_char_hook.
+        menubar = wx.MenuBar()
+        file_menu, tools_menu, help_menu = wx.Menu(), wx.Menu(), wx.Menu()
+        self._add_item(file_menu, "&Open echo...\tCtrl+O", self.open_dialog)
+        self._add_item(tools_menu, "&Grow polygon\tCtrl+R", self.grow_current)
+        self._add_item(tools_menu, "&Propagate polygon\tCtrl+T", self.propagate_current)
+        self._curvature_item = tools_menu.AppendCheckItem(wx.ID_ANY, "Preserve contour &curvature when propagating")
+        self._curvature_item.Check(self._settings.ReadBool(PRESERVE_CURVATURE_KEY, False))
+        self.Bind(
+            wx.EVT_MENU,
+            lambda event: self.set_preserve_curvature(self._curvature_item.IsChecked()),
+            self._curvature_item,
+        )
+        self._add_item(help_menu, "&Controls...", self.show_controls)
+        menubar.Append(file_menu, "&File")
+        menubar.Append(tools_menu, "&Tools")
+        menubar.Append(help_menu, "&Help")
+        self.SetMenuBar(menubar)
 
-        self._timer = QTimer(self)
-        self._timer.timeout.connect(self._on_tick)
+        self._timer = wx.Timer(self)
+        self.Bind(wx.EVT_TIMER, lambda event: self._on_tick(), source=self._timer)
+        self.Bind(wx.EVT_CHAR_HOOK, self._on_char_hook)
+        self.Bind(wx.EVT_CLOSE, self._on_close)
 
         self.clip: Clip | None = None
         self.frame = 0
@@ -132,27 +147,71 @@ class MainWindow(QMainWindow):
         self._siblings: list[Path] = []
         self._index = -1
 
+    def _add_item(self, menu: wx.Menu, label: str, handler) -> None:
+        item = menu.Append(wx.ID_ANY, label)
+        self.Bind(wx.EVT_MENU, lambda event: handler(), item)
+
+    def _on_close(self, event: wx.CloseEvent) -> None:
+        self._timer.Stop()
+        self._message_timer.Stop()
+        event.Skip()  # carry on with the default close
+
+    # ---- status bar ----------------------------------------------------------------------
+
+    def _say(self, text: str, timeout_ms: int) -> None:
+        """Show `text` in the status bar for `timeout_ms`, then go back to the info line."""
+        self._message = text
+        self.SetStatusText(text)
+        self._message_timer.StartOnce(timeout_ms)
+
+    def _on_message_expired(self, event: wx.TimerEvent) -> None:
+        self._message = ""
+        self.SetStatusText(self._info_text)
+
+    def current_message(self) -> str:
+        return self._message
+
+    @property
+    def preserve_curvature(self) -> bool:
+        return self._curvature_item.IsChecked()
+
+    def set_preserve_curvature(self, on: bool) -> None:
+        self._curvature_item.Check(on)
+        self._settings.WriteBool(PRESERVE_CURVATURE_KEY, on)
+        self._settings.Flush()
+
     def show_controls(self) -> None:
-        box = QMessageBox(QMessageBox.Icon.Information, "Controls", CONTROLS, parent=self)
-        box.setFont(QFontDatabase.systemFont(QFontDatabase.SystemFont.FixedFont))
-        box.exec()
+        with wx.Dialog(self, title="Controls", style=wx.DEFAULT_DIALOG_STYLE | wx.RESIZE_BORDER) as dialog:
+            text = wx.TextCtrl(dialog, value=CONTROLS, style=wx.TE_MULTILINE | wx.TE_READONLY | wx.TE_DONTWRAP)
+            text.SetFont(wx.Font(wx.FontInfo(10).Family(wx.FONTFAMILY_TELETYPE)))
+            sizer = wx.BoxSizer(wx.VERTICAL)
+            sizer.Add(text, 1, wx.EXPAND | wx.ALL, 8)
+            sizer.Add(dialog.CreateStdDialogButtonSizer(wx.OK), 0, wx.EXPAND | wx.ALL, 8)
+            dialog.SetSizer(sizer)
+            dialog.SetEscapeId(wx.ID_OK)
+            dialog.SetClientSize(text.GetTextExtent("x" * 100).Width + 40, 560)
+            dialog.ShowModal()
 
     # ---- loading -------------------------------------------------------------------------
 
     def open_dialog(self) -> None:
         start = str(self.clip.path.parent) if self.clip else ""
-        name, _ = QFileDialog.getOpenFileName(
-            self, "Open echo", start, "Echo videos (*.avi);;All files (*)"
-        )
-        if name:
-            self.open_path(Path(name))
+        with wx.FileDialog(
+            self,
+            "Open echo",
+            defaultDir=start,
+            wildcard="Echo videos (*.avi)|*.avi|All files (*.*)|*.*",
+            style=wx.FD_OPEN | wx.FD_FILE_MUST_EXIST,
+        ) as dialog:
+            if dialog.ShowModal() == wx.ID_OK:
+                self.open_path(Path(dialog.GetPath()))
 
     def open_path(self, path: Path) -> bool:
         """Load `path` and start playing it. Leaves the current clip untouched on failure."""
         try:
             clip = load_clip(path)
         except ClipLoadError as exc:
-            self.statusBar().showMessage(f"Could not open: {exc}", 8000)
+            self._say(f"Could not open: {exc}", 8000)
             return False
         self._siblings = sibling_clips(path)
         self._index = self._siblings.index(path)
@@ -167,7 +226,7 @@ class MainWindow(QMainWindow):
         self.frame = 0
         self.viewer.reset_view()
         self.annotations = self._annotations_for(clip)
-        self.setWindowTitle(f"{clip.path.name} - {TITLE}")
+        self.SetTitle(f"{clip.path.name} - {TITLE}")
         self._render()
         self.set_playing(True)
 
@@ -191,7 +250,7 @@ class MainWindow(QMainWindow):
             annotations = AnnotationSet.load(clip.path, clip.n_frames, height, width)
         except AnnotationError as exc:
             self._annotation_cache.pop(key, None)
-            self.statusBar().showMessage(f"Annotation disabled for this file: {exc}", 10000)
+            self._say(f"Annotation disabled for this file: {exc}", 10000)
             return None
         self._annotation_cache[key] = annotations
         return annotations
@@ -210,7 +269,7 @@ class MainWindow(QMainWindow):
             self._index = i
             self._show_clip(clip)
             return
-        self.statusBar().showMessage(
+        self._say(
             "Last file in folder" if step > 0 else "First file in folder", 2000
         )
 
@@ -222,9 +281,9 @@ class MainWindow(QMainWindow):
         if playing:
             self._end_drag()
             self._discard_pending()
-            self._timer.start(round(1000 / self.clip.fps))
+            self._timer.Start(round(1000 / self.clip.fps))
         else:
-            self._timer.stop()
+            self._timer.Stop()
         self.playing = playing
         self._set_cursor(False)
         self._update_info()
@@ -262,7 +321,9 @@ class MainWindow(QMainWindow):
                 f"   polygons {len(self.annotations.on_frame(self.frame))}"
                 f"   annotated frames {len(self.annotations.annotated_frames())}"
             )
-        self._info.setText(text)
+        self._info_text = text
+        if not self._message:
+            self.SetStatusText(text)
 
     # ---- annotation ----------------------------------------------------------------------
 
@@ -274,21 +335,21 @@ class MainWindow(QMainWindow):
         if self.clip is None:
             return False
         if self.annotations is None:
-            self.statusBar().showMessage("Annotation is disabled for this file", 3000)
+            self._say("Annotation is disabled for this file", 3000)
             return False
         if self.playing:
-            self.statusBar().showMessage("Pause (Space) to annotate", 2000)
+            self._say("Pause (Space) to annotate", 2000)
             return False
         return True
 
     def _set_cursor(self, over_vertex: bool) -> None:
         if self.playing or not self.annotations:
-            shape = Qt.CursorShape.ArrowCursor
+            shape = wx.CURSOR_ARROW
         elif over_vertex:
-            shape = Qt.CursorShape.SizeAllCursor
+            shape = wx.CURSOR_SIZING
         else:
-            shape = Qt.CursorShape.CrossCursor
-        self.viewer.setCursor(shape)
+            shape = wx.CURSOR_CROSS
+        self.viewer.SetCursor(wx.Cursor(shape))
 
     def _hit_radius(self) -> float:
         return HIT_RADIUS_PX / self.viewer.scale()
@@ -301,20 +362,20 @@ class MainWindow(QMainWindow):
     def _discard_pending(self) -> None:
         if self.pending:
             self.pending = []
-            self.statusBar().showMessage("Unfinished polygon discarded", 2000)
+            self._say("Unfinished polygon discarded", 2000)
             self._refresh_overlay()
 
-    def _on_pressed(self, x: float, y: float, modifiers) -> None:
+    def _on_pressed(self, x: float, y: float, modifiers: int) -> None:
         if not self._can_edit():
             return
         if self.pending:
             self._add_vertex(x, y)
             return
         polygons = self.annotations.on_frame(self.frame)
-        if modifiers & Qt.KeyboardModifier.ControlModifier:
+        if modifiers & MOD_CTRL:
             self.selected = polygon_at(polygons, x, y)
             self._refresh_overlay()
-        elif modifiers & Qt.KeyboardModifier.ShiftModifier:
+        elif modifiers & MOD_SHIFT:
             hit = nearest_edge(polygons, x, y, self._hit_radius())
             if hit:
                 polygon, edge, point = hit
@@ -366,7 +427,7 @@ class MainWindow(QMainWindow):
             self.selected = polygon
             self._after_edit()
         else:
-            self.statusBar().showMessage(
+            self._say(
                 "A polygon needs at least 3 vertices - Ctrl+click it and press Delete to remove it", 4000
             )
 
@@ -382,7 +443,7 @@ class MainWindow(QMainWindow):
         if not self.pending or not self._can_edit():
             return
         if len(self.pending) < 3:
-            self.statusBar().showMessage("A polygon needs at least 3 points", 2000)
+            self._say("A polygon needs at least 3 points", 2000)
             return
         self.annotations.add(self.frame, self.pending)
         self.pending = []
@@ -407,7 +468,7 @@ class MainWindow(QMainWindow):
     def _travel_history(self, move, empty_message: str) -> None:
         frame = move()
         if frame is None:
-            self.statusBar().showMessage(empty_message, 2000)
+            self._say(empty_message, 2000)
             return
         self.frame = frame  # show the frame that changed
         self.selected = None
@@ -419,7 +480,7 @@ class MainWindow(QMainWindow):
         if not self._can_edit():
             return None
         if self.pending:
-            self.statusBar().showMessage("Finish the polygon (Enter) or discard it (Esc) first", 3000)
+            self._say("Finish the polygon (Enter) or discard it (Esc) first", 3000)
             return None
         polygons = self.annotations.on_frame(self.frame)
         if self.selected is not None and self.selected < len(polygons):
@@ -427,7 +488,7 @@ class MainWindow(QMainWindow):
         elif len(polygons) == 1:
             index = 0
         else:
-            self.statusBar().showMessage(
+            self._say(
                 "Select a polygon first (Ctrl+click)" if polygons else "No polygon on this frame", 3000
             )
             return None
@@ -442,18 +503,14 @@ class MainWindow(QMainWindow):
         with _busy():
             grown = grow_polygon(self.clip.gray(self.frame), polygon)
         if grown is None:
-            self.statusBar().showMessage("Nothing to grow: the polygon already meets strong edges", 3000)
+            self._say("Nothing to grow: the polygon already meets strong edges", 3000)
             return
         self.annotations.replace_polygon(self.frame, index, grown)
         self.selected = index
         self._after_edit()
-        self.statusBar().showMessage(
+        self._say(
             f"Grew polygon from {polygon_area(polygon):.0f} to {polygon_area(grown):.0f} px²", 4000
         )
-
-    @property
-    def preserve_curvature(self) -> bool:
-        return self._curvature_action.isChecked()
 
     def propagate_current(self) -> None:
         """Ctrl+T: track the current polygon to every other frame with sparse optical flow."""
@@ -466,7 +523,7 @@ class MainWindow(QMainWindow):
                 self.clip.gray, self.clip.n_frames, self.frame, polygon, self.preserve_curvature
             )
         if not tracked:
-            self.statusBar().showMessage("Could not track the polygon to any other frame", 4000)
+            self._say("Could not track the polygon to any other frame", 4000)
             return
         replaced = sum(1 for frame in tracked if self.annotations.on_frame(frame))
         self.annotations.set_frames(self.frame, tracked)
@@ -480,7 +537,7 @@ class MainWindow(QMainWindow):
             message += f" (replaced annotations on {replaced})"
         if len(tracked) < self.clip.n_frames - 1:
             message += " - tracking was lost before the clip ended"
-        self.statusBar().showMessage(message, 6000)
+        self._say(message, 6000)
 
     def delete_selected_or_clear(self) -> None:
         if not self._can_edit():
@@ -504,65 +561,59 @@ class MainWindow(QMainWindow):
         try:
             self.annotations.save()
         except OSError as exc:
-            self.statusBar().showMessage(f"Could not save annotations: {exc}", 10000)
+            self._say(f"Could not save annotations: {exc}", 10000)
 
     # ---- events --------------------------------------------------------------------------
 
-    def keyPressEvent(self, event: QKeyEvent) -> None:
-        key = event.key()
-        ctrl = bool(event.modifiers() & Qt.KeyboardModifier.ControlModifier)
-        if key == Qt.Key.Key_Space:
-            if not event.isAutoRepeat():
+    def _on_char_hook(self, event: wx.KeyEvent) -> None:
+        key = event.GetKeyCode()
+        cmd = event.CmdDown()
+        if key == wx.WXK_SPACE:
+            if not event.IsAutoRepeat():
                 self.set_playing(not self.playing)
-        elif key in (Qt.Key.Key_Left, Qt.Key.Key_Right):
+        elif key in (wx.WXK_LEFT, wx.WXK_RIGHT):
             if not self.playing:
-                self.step(-1 if key == Qt.Key.Key_Left else 1)
-        elif key == Qt.Key.Key_Up:
+                self.step(-1 if key == wx.WXK_LEFT else 1)
+        elif key == wx.WXK_UP:
             self.open_sibling(+1)
-        elif key == Qt.Key.Key_Down:
+        elif key == wx.WXK_DOWN:
             self.open_sibling(-1)
-        elif key in (Qt.Key.Key_Return, Qt.Key.Key_Enter):
+        elif key in (wx.WXK_RETURN, wx.WXK_NUMPAD_ENTER):
             self.finish_polygon()
-        elif key == Qt.Key.Key_Escape:
+        elif key == wx.WXK_ESCAPE:
             self.escape()
-        elif key == Qt.Key.Key_Backspace:
+        elif key == wx.WXK_BACK:
             if self.pending:  # only ever removes a vertex, never a finished polygon
                 self.undo()
-        elif ctrl and key == Qt.Key.Key_Z:
+        elif cmd and key == ord("Z"):
             self.undo()
-        elif ctrl and key == Qt.Key.Key_Y:
+        elif cmd and key == ord("Y"):
             self.redo()
-        elif ctrl and key == Qt.Key.Key_R:
-            self.grow_current()
-        elif ctrl and key == Qt.Key.Key_T:
-            self.propagate_current()
-        elif ctrl and key in (Qt.Key.Key_Equal, Qt.Key.Key_Plus):
+        elif cmd and key in (ord("="), ord("+"), wx.WXK_ADD, wx.WXK_NUMPAD_ADD):
             self.viewer.zoom_by(ZOOM_KEY_STEP)
-        elif ctrl and key == Qt.Key.Key_Minus:
+        elif cmd and key in (ord("-"), wx.WXK_SUBTRACT, wx.WXK_NUMPAD_SUBTRACT):
             self.viewer.zoom_by(1 / ZOOM_KEY_STEP)
-        elif ctrl and key == Qt.Key.Key_0:
+        elif cmd and key in (ord("0"), wx.WXK_NUMPAD0):
             self.viewer.reset_view()
-        elif key == Qt.Key.Key_Delete:
+        elif key == wx.WXK_DELETE:
             self.delete_selected_or_clear()
         else:
-            super().keyPressEvent(event)
+            event.Skip()  # includes the menu accelerators (Ctrl+O / Ctrl+R / Ctrl+T)
 
-    def dragEnterEvent(self, event: QDragEnterEvent) -> None:
-        if any(url.isLocalFile() for url in event.mimeData().urls()):
-            event.acceptProposedAction()
 
-    def dropEvent(self, event: QDropEvent) -> None:
-        for url in event.mimeData().urls():
-            if url.isLocalFile():
-                self.open_path(Path(url.toLocalFile()))
-                event.acceptProposedAction()
-                return
+class _App(wx.App):
+    window: MainWindow | None = None
+
+    def MacOpenFiles(self, filenames: list[str]) -> None:  # Finder "Open With" / dropping a file on the Dock icon
+        if self.window is not None and filenames:
+            self.window.open_path(Path(filenames[0]))
 
 
 def main() -> None:
-    app = QApplication(sys.argv)
-    window = MainWindow()
-    window.show()
+    app = _App(False)
+    app.SetAppName(APP_NAME)
+    window = app.window = MainWindow()
+    window.Show()
     if len(sys.argv) > 1:
         window.open_path(Path(sys.argv[1]))
-    sys.exit(app.exec())
+    app.MainLoop()

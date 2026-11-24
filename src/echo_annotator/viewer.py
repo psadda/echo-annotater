@@ -2,10 +2,12 @@
 
 from __future__ import annotations
 
+import math
+from typing import NamedTuple
+
+import cv2
 import numpy as np
-from PySide6.QtCore import QPointF, QRectF, Qt, Signal
-from PySide6.QtGui import QColor, QImage, QMouseEvent, QPainter, QPen, QPolygonF, QWheelEvent
-from PySide6.QtWidgets import QWidget
+import wx
 
 Polygon = list[tuple[float, float]]
 
@@ -13,49 +15,121 @@ MAX_ZOOM = 20.0
 ZOOM_STEP = 1.25  # per wheel notch
 SMOOTH_BELOW_SCALE = 2.0  # widget pixels per image pixel
 
-FILL = QColor(255, 200, 0, 70)
-OUTLINE = QColor(255, 200, 0)
-SELECTED = QColor(255, 255, 255)
-PENDING = QColor(0, 220, 255)
+# Modifier bit flags passed with the `pressed` signal.
+MOD_CTRL = 1  # Ctrl on Windows/Linux, Cmd on macOS
+MOD_SHIFT = 2
+MOD_ALT = 4
+
+FILL = wx.Colour(255, 200, 0, 70)
+OUTLINE = wx.Colour(255, 200, 0)
+SELECTED = wx.Colour(255, 255, 255)
+PENDING = wx.Colour(0, 220, 255)
 
 
-class ViewerWidget(QWidget):
+class Rect(NamedTuple):
+    x: float
+    y: float
+    w: float
+    h: float
+
+    @property
+    def right(self) -> float:
+        return self.x + self.w
+
+    @property
+    def bottom(self) -> float:
+        return self.y + self.h
+
+    @property
+    def empty(self) -> bool:
+        return self.w <= 0 or self.h <= 0
+
+    def contains(self, point: tuple[float, float]) -> bool:
+        return not self.empty and self.x <= point[0] <= self.right and self.y <= point[1] <= self.bottom
+
+
+class Signal:
+    """Minimal stand-in for a signal: `connect` callbacks, `emit` calls them in order."""
+
+    def __init__(self) -> None:
+        self._slots: list = []
+
+    def connect(self, slot) -> None:
+        self._slots.append(slot)
+
+    def emit(self, *args) -> None:
+        for slot in list(self._slots):
+            slot(*args)
+
+
+def _modifiers(event: wx.MouseEvent) -> int:
+    return (
+        (MOD_CTRL if event.CmdDown() else 0)
+        | (MOD_SHIFT if event.ShiftDown() else 0)
+        | (MOD_ALT if event.AltDown() else 0)
+    )
+
+
+class ViewerWidget(wx.Window):
     # All coordinates are image coordinates.
-    pressed = Signal(float, float, object)  # left press inside the image, with Qt.KeyboardModifier flags
-    dragged = Signal(float, float)  # left button held; clamped to the image
-    released = Signal()
-    right_pressed = Signal(float, float)
-    hovered = Signal(float, float)  # no button held
-    finish_requested = Signal()  # double-click
-    view_changed = Signal()  # zoom or pan changed
+    #   pressed(x, y, modifiers)  left press inside the image; modifiers is a MOD_* bit mask
+    #   dragged(x, y)             left button held; clamped to the image
+    #   released()
+    #   right_pressed(x, y)
+    #   hovered(x, y)             no button held
+    #   finish_requested()        double-click
+    #   view_changed()            zoom or pan changed
 
-    def __init__(self, parent: QWidget | None = None) -> None:
+    def __init__(self, parent: wx.Window) -> None:
         super().__init__(parent)
-        self.setMinimumSize(320, 240)
-        self.setFocusPolicy(Qt.FocusPolicy.NoFocus)
-        self.setMouseTracking(True)  # for the rubber-band line while drawing
-        self._image: QImage | None = None
+        self.SetMinSize((320, 240))
+        self.SetBackgroundStyle(wx.BG_STYLE_PAINT)
+        self.pressed = Signal()
+        self.dragged = Signal()
+        self.released = Signal()
+        self.right_pressed = Signal()
+        self.hovered = Signal()
+        self.finish_requested = Signal()
+        self.view_changed = Signal()
+
+        self._image: np.ndarray | None = None  # H x W x 3 uint8, RGB
         self._polygons: list[Polygon] = []
         self._pending: Polygon = []
         self._selected: int | None = None
-        self._cursor: QPointF | None = None
+        self._cursor: tuple[float, float] | None = None
         self._zoom = 1.0  # 1 = fit to window
-        self._pan = QPointF(0, 0)  # offset in widget pixels from the centred position
-        self._pan_from: QPointF | None = None
+        self._pan = (0.0, 0.0)  # offset in widget pixels from the centred position
+        self._pan_from: tuple[float, float] | None = None
+
+        self.Bind(wx.EVT_PAINT, self._on_paint)
+        self.Bind(wx.EVT_ERASE_BACKGROUND, lambda event: None)
+        self.Bind(wx.EVT_SIZE, lambda event: (self.Refresh(), event.Skip()))
+        self.Bind(wx.EVT_MOUSEWHEEL, self._on_wheel)
+        self.Bind(wx.EVT_LEFT_DOWN, self._on_left_down)
+        self.Bind(wx.EVT_LEFT_DCLICK, self._on_left_dclick)
+        self.Bind(wx.EVT_LEFT_UP, self._on_left_up)
+        self.Bind(wx.EVT_RIGHT_DOWN, self._on_right_down)
+        self.Bind(wx.EVT_MIDDLE_DOWN, self._on_middle_down)
+        self.Bind(wx.EVT_MIDDLE_UP, self._on_middle_up)
+        self.Bind(wx.EVT_MOTION, self._on_motion)
+        self.Bind(wx.EVT_LEAVE_WINDOW, self._on_leave)
+        self.Bind(wx.EVT_MOUSE_CAPTURE_LOST, self._on_capture_lost)
+
+    def AcceptsFocus(self) -> bool:  # keys are handled by the main window
+        return False
 
     def set_frame(self, frame: np.ndarray) -> None:
-        frame = np.ascontiguousarray(frame)
-        height, width = frame.shape[:2]
-        fmt = QImage.Format.Format_RGB888 if frame.ndim == 3 else QImage.Format.Format_Grayscale8
-        # copy() so the QImage owns its pixels and never outlives the numpy buffer
-        self._image = QImage(frame.data, width, height, frame.strides[0], fmt).copy()
-        self.update()
+        frame = np.asarray(frame)
+        if frame.ndim == 2:
+            frame = cv2.cvtColor(frame, cv2.COLOR_GRAY2RGB)
+        self._image = np.ascontiguousarray(frame)
+        self.Refresh()
 
     def set_overlay(self, polygons: list[Polygon], pending: Polygon, selected: int | None) -> None:
         self._polygons = polygons
         self._pending = pending
         self._selected = selected
-        self.update()
+        self.Refresh()
 
     # ---- geometry ------------------------------------------------------------------------
 
@@ -63,150 +137,227 @@ class ViewerWidget(QWidget):
     def zoom(self) -> float:
         return self._zoom
 
+    def _size(self) -> tuple[int, int]:
+        return tuple(self.GetClientSize())
+
+    def _image_size(self) -> tuple[int, int]:
+        height, width = self._image.shape[:2]
+        return width, height
+
     def _view_size(self) -> tuple[float, float]:
         """Size in widget pixels of the whole image at the current zoom."""
-        fit = min(self.width() / self._image.width(), self.height() / self._image.height())
-        return self._image.width() * fit * self._zoom, self._image.height() * fit * self._zoom
+        (iw, ih), (ww, wh) = self._image_size(), self._size()
+        fit = min(ww / iw, wh / ih)
+        return iw * fit * self._zoom, ih * fit * self._zoom
 
-    def _clamp_pan(self, pan: QPointF, w: float, h: float) -> QPointF:
+    def _clamp_pan(self, pan: tuple[float, float], w: float, h: float) -> tuple[float, float]:
         """Keep a zoomed image covering the widget; an image smaller than the widget stays centred."""
-        limit_x, limit_y = max(0.0, (w - self.width()) / 2), max(0.0, (h - self.height()) / 2)
-        return QPointF(min(max(pan.x(), -limit_x), limit_x), min(max(pan.y(), -limit_y), limit_y))
+        ww, wh = self._size()
+        limit_x, limit_y = max(0.0, (w - ww) / 2), max(0.0, (h - wh) / 2)
+        return min(max(pan[0], -limit_x), limit_x), min(max(pan[1], -limit_y), limit_y)
 
-    def image_rect(self) -> QRectF:
+    def image_rect(self) -> Rect:
         """Widget-space rectangle the image is drawn into (empty if nothing is loaded)."""
         if self._image is None:
-            return QRectF()
+            return Rect(0, 0, 0, 0)
         w, h = self._view_size()
-        pan = self._clamp_pan(self._pan, w, h)
-        return QRectF((self.width() - w) / 2 + pan.x(), (self.height() - h) / 2 + pan.y(), w, h)
+        ww, wh = self._size()
+        px, py = self._clamp_pan(self._pan, w, h)
+        return Rect((ww - w) / 2 + px, (wh - h) / 2 + py, w, h)
 
-    def zoom_by(self, factor: float, anchor: QPointF | None = None) -> None:
+    def zoom_by(self, factor: float, anchor: tuple[float, float] | None = None) -> None:
         """Zoom by `factor`, keeping the image point under `anchor` (default: widget centre) fixed."""
         if self._image is None:
             return
-        anchor = anchor if anchor is not None else QPointF(self.width() / 2, self.height() / 2)
+        ww, wh = self._size()
+        anchor = anchor if anchor is not None else (ww / 2, wh / 2)
         ix, iy = self.to_image(anchor)
         self._zoom = min(max(self._zoom * factor, 1.0), MAX_ZOOM)
         w, h = self._view_size()
-        s = w / self._image.width()
-        pan = QPointF(anchor.x() - ix * s - (self.width() - w) / 2, anchor.y() - iy * s - (self.height() - h) / 2)
+        s = w / self._image_size()[0]
+        pan = (anchor[0] - ix * s - (ww - w) / 2, anchor[1] - iy * s - (wh - h) / 2)
         self._pan = self._clamp_pan(pan, w, h)
-        self.update()
+        self.Refresh()
         self.view_changed.emit()
 
     def reset_view(self) -> None:
-        self._zoom, self._pan = 1.0, QPointF(0, 0)
-        self.update()
+        self._zoom, self._pan = 1.0, (0.0, 0.0)
+        self.Refresh()
         self.view_changed.emit()
 
     def scale(self) -> float:
         """Widget pixels per image pixel."""
-        return self.image_rect().width() / self._image.width() if self._image else 1.0
+        return self.image_rect().w / self._image_size()[0] if self._image is not None else 1.0
 
-    def to_image(self, pos: QPointF, clamp: bool = False) -> tuple[float, float]:
+    def to_image(self, pos: tuple[float, float], clamp: bool = False) -> tuple[float, float]:
         rect, s = self.image_rect(), self.scale()
-        x, y = (pos.x() - rect.x()) / s, (pos.y() - rect.y()) / s
+        x, y = (pos[0] - rect.x) / s, (pos[1] - rect.y) / s
         if clamp:
-            x, y = min(max(x, 0.0), rect.width() / s), min(max(y, 0.0), rect.height() / s)
+            x, y = min(max(x, 0.0), rect.w / s), min(max(y, 0.0), rect.h / s)
         return x, y
 
-    def to_widget(self, x: float, y: float) -> QPointF:
+    def to_widget(self, x: float, y: float) -> tuple[float, float]:
         rect, s = self.image_rect(), self.scale()
-        return QPointF(rect.x() + x * s, rect.y() + y * s)
+        return rect.x + x * s, rect.y + y * s
 
     # ---- events --------------------------------------------------------------------------
 
-    def wheelEvent(self, event: QWheelEvent) -> None:
-        delta = event.angleDelta().y()
-        if delta:
-            self.zoom_by(ZOOM_STEP ** (delta / 120), event.position())
-        event.accept()
+    def _grab(self) -> None:
+        if not self.HasCapture():  # keeps drags going when the pointer leaves the widget
+            self.CaptureMouse()
 
-    def mousePressEvent(self, event: QMouseEvent) -> None:
-        button = event.button()
-        if button == Qt.MouseButton.MiddleButton or (
-            button == Qt.MouseButton.LeftButton and event.modifiers() & Qt.KeyboardModifier.AltModifier
-        ):
-            self._pan_from = event.position()
-            return
-        if not self.image_rect().contains(event.position()):
-            return
-        if event.button() == Qt.MouseButton.LeftButton:
-            self.pressed.emit(*self.to_image(event.position()), event.modifiers())
-        elif event.button() == Qt.MouseButton.RightButton:
-            self.right_pressed.emit(*self.to_image(event.position()))
+    def _ungrab(self) -> None:
+        if self.HasCapture():
+            self.ReleaseMouse()
 
-    def mouseDoubleClickEvent(self, event: QMouseEvent) -> None:
+    def _on_wheel(self, event: wx.MouseEvent) -> None:
+        if event.GetWheelAxis() == wx.MOUSE_WHEEL_VERTICAL:
+            delta = event.GetWheelDelta() or 120
+            rotation = event.GetWheelRotation()
+            if rotation:
+                self.zoom_by(ZOOM_STEP ** (rotation / delta), tuple(event.GetPosition()))
+
+    def _start_pan(self, event: wx.MouseEvent) -> None:
+        self._pan_from = tuple(event.GetPosition())
+        self._grab()
+
+    def _on_left_down(self, event: wx.MouseEvent) -> None:
+        if event.AltDown():
+            self._start_pan(event)
+            return
+        pos = tuple(event.GetPosition())
+        if not self.image_rect().contains(pos):
+            return
+        self._grab()
+        self.pressed.emit(*self.to_image(pos), _modifiers(event))
+
+    def _on_middle_down(self, event: wx.MouseEvent) -> None:
+        self._start_pan(event)
+
+    def _on_right_down(self, event: wx.MouseEvent) -> None:
+        pos = tuple(event.GetPosition())
+        if self.image_rect().contains(pos):
+            self.right_pressed.emit(*self.to_image(pos))
+
+    def _on_left_dclick(self, event: wx.MouseEvent) -> None:
         # The first click of the double-click already added the final vertex.
-        if event.button() == Qt.MouseButton.LeftButton:
-            self.finish_requested.emit()
+        self.finish_requested.emit()
 
-    def mouseMoveEvent(self, event: QMouseEvent) -> None:
-        self._cursor = event.position()
+    def _on_motion(self, event: wx.MouseEvent) -> None:
+        pos = tuple(event.GetPosition())
+        self._cursor = pos
         if self._pan_from is not None:
             w, h = self._view_size()
-            self._pan = self._clamp_pan(self._pan + event.position() - self._pan_from, w, h)
-            self._pan_from = event.position()
-            self.update()
+            moved = (self._pan[0] + pos[0] - self._pan_from[0], self._pan[1] + pos[1] - self._pan_from[1])
+            self._pan = self._clamp_pan(moved, w, h)
+            self._pan_from = pos
+            self.Refresh()
             self.view_changed.emit()
             return
-        if event.buttons() & Qt.MouseButton.LeftButton:
-            self.dragged.emit(*self.to_image(event.position(), clamp=True))
+        if event.LeftIsDown():
+            self.dragged.emit(*self.to_image(pos, clamp=True))
         else:
-            self.hovered.emit(*self.to_image(event.position()))
+            self.hovered.emit(*self.to_image(pos))
         if self._pending:
-            self.update()
+            self.Refresh()
 
-    def mouseReleaseEvent(self, event: QMouseEvent) -> None:
-        if self._pan_from is not None:
-            if event.button() in (Qt.MouseButton.MiddleButton, Qt.MouseButton.LeftButton):
-                self._pan_from = None
-            return
-        if event.button() == Qt.MouseButton.LeftButton:
+    def _on_left_up(self, event: wx.MouseEvent) -> None:
+        was_panning = self._pan_from is not None
+        self._pan_from = None
+        self._ungrab()
+        if not was_panning:
             self.released.emit()
 
-    def leaveEvent(self, event) -> None:
+    def _on_middle_up(self, event: wx.MouseEvent) -> None:
+        self._pan_from = None
+        self._ungrab()
+
+    def _on_capture_lost(self, event: wx.MouseCaptureLostEvent) -> None:
+        self._pan_from = None
+
+    def _on_leave(self, event: wx.MouseEvent) -> None:
         self._cursor = None
         if self._pending:
-            self.update()
+            self.Refresh()
+        event.Skip()
 
-    def paintEvent(self, event) -> None:
-        painter = QPainter(self)
-        painter.fillRect(self.rect(), QColor(0, 0, 0))
+    # ---- painting ------------------------------------------------------------------------
+
+    def _on_paint(self, event: wx.PaintEvent) -> None:
+        self.paint(wx.AutoBufferedPaintDC(self))
+
+    def paint(self, dc: wx.DC) -> None:
+        dc.SetBackground(wx.BLACK_BRUSH)
+        dc.Clear()
         if self._image is None:
             return
+        self._draw_image(dc)
+        gc = wx.GraphicsContext.Create(dc)
+        if gc is not None:
+            self._draw_overlay(gc)
+
+    def _draw_image(self, dc: wx.DC) -> None:
         rect, s = self.image_rect(), self.scale()
-        # Draw only the visible part: at high zoom the full target rect would be enormous.
-        target = rect.intersected(QRectF(self.rect()))
-        source = QRectF((target.x() - rect.x()) / s, (target.y() - rect.y()) / s, target.width() / s, target.height() / s)
-        painter.setRenderHint(QPainter.RenderHint.SmoothPixmapTransform, s < SMOOTH_BELOW_SCALE)  # show crisp pixels when zoomed in
-        painter.drawImage(target, self._image, source)
-        painter.setRenderHint(QPainter.RenderHint.Antialiasing)
+        ww, wh = self._size()
+        # Draw only the visible part: at high zoom the full image rect would be enormous.
+        # The region is aligned to whole widget pixels so it can be blitted at an integer position.
+        x0, y0 = math.floor(max(rect.x, 0)), math.floor(max(rect.y, 0))
+        x1, y1 = math.ceil(min(rect.right, ww)), math.ceil(min(rect.bottom, wh))
+        if x1 <= x0 or y1 <= y0:
+            return
+        cs = max(1.0, self.GetContentScaleFactor())  # render at device resolution on HiDPI/Retina screens
+        w, h, d = round((x1 - x0) * cs), round((y1 - y0) * cs), s * cs
+        # Map device pixel (u, v) of the region back to image pixel coordinates (pixel centres at integers).
+        matrix = np.array(
+            [
+                [1 / d, 0, (0.5 + x0 * cs - rect.x * cs) / d - 0.5],
+                [0, 1 / d, (0.5 + y0 * cs - rect.y * cs) / d - 0.5],
+            ]
+        )
+        interpolation = cv2.INTER_LINEAR if s < SMOOTH_BELOW_SCALE else cv2.INTER_NEAREST  # crisp pixels when zoomed in
+        pixels = cv2.warpAffine(
+            self._image, matrix, (w, h), flags=interpolation | cv2.WARP_INVERSE_MAP, borderMode=cv2.BORDER_REPLICATE
+        )
+        bitmap = wx.Bitmap.FromBuffer(w, h, pixels)
+        if cs != 1.0:
+            bitmap.SetScaleFactor(cs)
+        dc.DrawBitmap(bitmap, x0, y0)
 
-        painter.setBrush(FILL)
+    def _draw_overlay(self, gc: wx.GraphicsContext) -> None:
+        def pen(colour: wx.Colour, width: float, style=wx.PENSTYLE_SOLID) -> wx.GraphicsPenInfo:
+            return gc.CreatePen(wx.GraphicsPenInfo(colour).Width(width).Style(style))
+
+        gc.SetAntialiasMode(wx.ANTIALIAS_DEFAULT)
+        gc.SetBrush(wx.Brush(FILL))
         for i, polygon in enumerate(self._polygons):
-            painter.setPen(QPen(SELECTED if i == self._selected else OUTLINE, 2.5 if i == self._selected else 1.5))
-            painter.drawPolygon(QPolygonF([self.to_widget(x, y) for x, y in polygon]))
+            selected = i == self._selected
+            gc.SetPen(pen(SELECTED if selected else OUTLINE, 2.5 if selected else 1.5))
+            path = gc.CreatePath()
+            points = [self.to_widget(x, y) for x, y in polygon]
+            path.MoveToPoint(*points[0])
+            for point in points[1:]:
+                path.AddLineToPoint(*point)
+            path.CloseSubpath()
+            gc.DrawPath(path)
 
+        gc.SetBrush(wx.TRANSPARENT_BRUSH)
         if self._selected is not None and self._selected < len(self._polygons):
-            painter.setPen(QPen(SELECTED, 1.5))
-            painter.setBrush(Qt.BrushStyle.NoBrush)
+            gc.SetPen(pen(SELECTED, 1.5))
             for x, y in self._polygons[self._selected]:  # square handles show what can be dragged
-                p = self.to_widget(x, y)
-                painter.drawRect(QRectF(p.x() - 4, p.y() - 4, 8, 8))
+                px, py = self.to_widget(x, y)
+                gc.DrawRectangle(px - 4, py - 4, 8, 8)
 
         if self._pending:
             points = [self.to_widget(x, y) for x, y in self._pending]
-            painter.setPen(QPen(PENDING, 1.5))
-            painter.setBrush(Qt.BrushStyle.NoBrush)
-            painter.drawPolyline(QPolygonF(points))
+            gc.SetPen(pen(PENDING, 1.5))
+            if len(points) > 1:
+                gc.StrokeLines([wx.Point2D(*p) for p in points])
             if self._cursor is not None and self.image_rect().contains(self._cursor):
-                painter.setPen(QPen(PENDING, 1, Qt.PenStyle.DashLine))
-                painter.drawLine(points[-1], self._cursor)
-            painter.setPen(QPen(PENDING, 1.5))
-            painter.setBrush(PENDING)
-            for point in points[1:]:
-                painter.drawEllipse(point, 3, 3)
-            painter.setBrush(Qt.BrushStyle.NoBrush)
-            painter.drawEllipse(points[0], 5, 5)  # ring marks the vertex that closes the polygon
+                gc.SetPen(pen(PENDING, 1, wx.PENSTYLE_SHORT_DASH))
+                gc.StrokeLine(*points[-1], *self._cursor)
+            gc.SetPen(pen(PENDING, 1.5))
+            gc.SetBrush(wx.Brush(PENDING))
+            for px, py in points[1:]:
+                gc.DrawEllipse(px - 3, py - 3, 6, 6)
+            gc.SetBrush(wx.TRANSPARENT_BRUSH)
+            gc.DrawEllipse(points[0][0] - 5, points[0][1] - 5, 10, 10)  # ring marks the vertex that closes the polygon
